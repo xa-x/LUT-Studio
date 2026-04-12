@@ -1,4 +1,4 @@
-import { LUT_GENERATE_SHADER, LUT_APPLY_SHADER } from './shaders';
+import { LUT_GENERATE_SHADER, LUT_APPLY_SHADER, LUT_BLIT_SHADER } from './shaders';
 
 export interface FilterParams {
   brightness: number;
@@ -73,24 +73,58 @@ export function freshParams(): FilterParams {
 
 export const DEFAULT_PARAMS: FilterParams = freshParams();
 
+/** Deep-clone default identity curves (safe for presets; avoids shared point refs). */
+export function cloneDefaultCurves(): Pick<
+  FilterParams,
+  "masterCurve" | "redCurve" | "greenCurve" | "blueCurve"
+> {
+  const copy = () => DEFAULT_CURVE.map((p) => ({ ...p }));
+  return {
+    masterCurve: copy(),
+    redCurve: copy(),
+    greenCurve: copy(),
+    blueCurve: copy(),
+  };
+}
+
 const LUT_SIZE = 32;
+
+const GEN_UNIFORM_SIZE = 256;
+const APPLY_UNIFORM_SIZE = 16;
 
 export class LUTEngine {
   private device: GPUDevice | null = null;
   private generatePipeline: GPUComputePipeline | null = null;
   private applyPipeline: GPUComputePipeline | null = null;
+  private blitPipeline: GPURenderPipeline | null = null;
+  private canvasFormat: GPUTextureFormat | null = null;
   private sampler: GPUSampler | null = null;
   private lutTexture: GPUTexture | null = null;
   private lutSize = LUT_SIZE;
 
+  /** Reused uniform buffers (avoid per-frame allocation). */
+  private genUniformBuffer: GPUBuffer | null = null;
+  private applyUniformBuffer: GPUBuffer | null = null;
+
+  /** Pooled textures / readback for apply pass (resize when dimensions change). */
+  private poolW = 0;
+  private poolH = 0;
+  private pooledInput: GPUTexture | null = null;
+  private pooledOutput: GPUTexture | null = null;
+  private pooledReadBuffer: GPUBuffer | null = null;
+
   async init(): Promise<boolean> {
     if (!navigator.gpu) return false;
 
-    const adapter = await navigator.gpu.requestAdapter();
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: 'high-performance',
+    });
     if (!adapter) return false;
 
     this.device = await adapter.requestDevice();
     if (!this.device) return false;
+
+    this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
 
     // Create compute pipelines
     this.generatePipeline = this.device.createComputePipeline({
@@ -109,12 +143,37 @@ export class LUTEngine {
       },
     });
 
+    const blitModule = this.device.createShaderModule({ code: LUT_BLIT_SHADER });
+    this.blitPipeline = this.device.createRenderPipeline({
+      layout: 'auto',
+      vertex: {
+        module: blitModule,
+        entryPoint: 'vs_main',
+      },
+      fragment: {
+        module: blitModule,
+        entryPoint: 'fs_main',
+        targets: [{ format: this.canvasFormat }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
     this.sampler = this.device.createSampler({
       magFilter: 'linear',
       minFilter: 'linear',
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
       addressModeW: 'clamp-to-edge',
+    });
+
+    this.genUniformBuffer = this.device.createBuffer({
+      size: GEN_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    this.applyUniformBuffer = this.device.createBuffer({
+      size: APPLY_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
     // Create persistent LUT 3D texture
@@ -130,13 +189,208 @@ export class LUTEngine {
     return true;
   }
 
+  private releasePool(): void {
+    this.pooledInput?.destroy();
+    this.pooledOutput?.destroy();
+    this.pooledReadBuffer?.destroy();
+    this.pooledInput = null;
+    this.pooledOutput = null;
+    this.pooledReadBuffer = null;
+    this.poolW = 0;
+    this.poolH = 0;
+  }
+
+  private ensurePool(width: number, height: number): boolean {
+    if (!this.device) return false;
+    if (this.poolW === width && this.poolH === height && this.pooledInput && this.pooledOutput && this.pooledReadBuffer) {
+      return true;
+    }
+
+    this.releasePool();
+    this.poolW = width;
+    this.poolH = height;
+
+    const texUsageIn =
+      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT;
+    const texUsageOut =
+      GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.COPY_SRC |
+      GPUTextureUsage.TEXTURE_BINDING;
+
+    this.pooledInput = this.device.createTexture({
+      size: [width, height],
+      format: 'rgba8unorm',
+      usage: texUsageIn,
+    });
+
+    this.pooledOutput = this.device.createTexture({
+      size: [width, height],
+      format: 'rgba8unorm',
+      usage: texUsageOut,
+    });
+
+    const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+    this.pooledReadBuffer = this.device.createBuffer({
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    return true;
+  }
+
+  /** Upload source image + apply uniforms; must run before the apply compute pass in the same frame. */
+  private queueApplyInputUpload(
+    imageBitmap: ImageBitmap | HTMLCanvasElement,
+    width: number,
+    height: number,
+  ): boolean {
+    if (!this.device || !this.pooledInput || !this.applyUniformBuffer) return false;
+    this.device.queue.copyExternalImageToTexture(
+      { source: imageBitmap },
+      { texture: this.pooledInput },
+      [width, height],
+    );
+    const applyDims = new Uint32Array([width, height, this.lutSize, 0]);
+    this.device.queue.writeBuffer(this.applyUniformBuffer, 0, applyDims);
+    return true;
+  }
+
+  /** Encode apply compute only (caller already queued upload + gen uniforms). */
+  private encodeApplyPass(encoder: GPUCommandEncoder): boolean {
+    if (!this.device || !this.applyPipeline || !this.lutTexture || !this.sampler || !this.applyUniformBuffer) {
+      return false;
+    }
+    if (!this.pooledInput || !this.pooledOutput) return false;
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.applyPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.applyUniformBuffer } },
+        { binding: 1, resource: this.pooledInput.createView() },
+        { binding: 2, resource: this.pooledOutput.createView() },
+        { binding: 3, resource: this.lutTexture.createView({ dimension: '3d' }) },
+        { binding: 4, resource: this.sampler },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.applyPipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(this.poolW / 16), Math.ceil(this.poolH / 16));
+    pass.end();
+
+    return true;
+  }
+
+  private writeGenUniforms(params: FilterParams): void {
+    if (!this.device || !this.genUniformBuffer) return;
+    const uniformData = this.packUniforms(params);
+    this.device.queue.writeBuffer(
+      this.genUniformBuffer,
+      0,
+      uniformData.buffer,
+      uniformData.byteOffset,
+      uniformData.byteLength,
+    );
+  }
+
+  private encodeGenerateLUTPass(encoder: GPUCommandEncoder): void {
+    if (!this.device || !this.generatePipeline || !this.lutTexture || !this.genUniformBuffer) return;
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.generatePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.genUniformBuffer } },
+        { binding: 1, resource: this.lutTexture.createView({ dimension: '3d' }) },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.generatePipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(
+      Math.ceil(this.lutSize / 4),
+      Math.ceil(this.lutSize / 4),
+      Math.ceil(this.lutSize / 4),
+    );
+    pass.end();
+  }
+
+  /**
+   * Fast preview: compute on GPU, blit to WebGPU canvas — no CPU readback.
+   */
+  presentPreviewToCanvas(canvas: HTMLCanvasElement, imageBitmap: ImageBitmap, params: FilterParams): boolean {
+    if (!this.device || !this.blitPipeline || !this.canvasFormat || !this.sampler) return false;
+
+    const width = imageBitmap.width;
+    const height = imageBitmap.height;
+
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext('webgpu');
+    if (!ctx) return false;
+
+    ctx.configure({
+      device: this.device,
+      format: this.canvasFormat,
+      alphaMode: 'opaque',
+    });
+
+    if (!this.ensurePool(width, height) || !this.pooledOutput) return false;
+
+    this.writeGenUniforms(params);
+    if (!this.queueApplyInputUpload(imageBitmap, width, height)) return false;
+
+    const encoder = this.device.createCommandEncoder();
+    this.encodeGenerateLUTPass(encoder);
+    if (!this.encodeApplyPass(encoder)) return false;
+
+    const blitBg = this.device.createBindGroup({
+      layout: this.blitPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.pooledOutput.createView() },
+        { binding: 1, resource: this.sampler },
+      ],
+    });
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: ctx.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
+    });
+    pass.setPipeline(this.blitPipeline);
+    pass.setBindGroup(0, blitBg);
+    pass.draw(3);
+    pass.end();
+
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
+  private curve5(
+    curve: CurvePoint[] | undefined,
+    fallback: typeof DEFAULT_CURVE,
+  ): { x: number; y: number }[] {
+    const src = curve?.length === 5 ? curve : fallback;
+    return Array.from({ length: 5 }, (_, i) => ({
+      x: Number.isFinite(src[i]?.x) ? src[i]!.x : fallback[i]!.x,
+      y: Number.isFinite(src[i]?.y) ? src[i]!.y : fallback[i]!.y,
+    }));
+  }
+
   private packUniforms(params: FilterParams): Float32Array {
     // Must match the shader struct layout exactly (all f32, aligned)
     // We need to pack curves as flat f32 pairs
-    const mc = params.masterCurve;
-    const rc = params.redCurve;
-    const gc = params.greenCurve;
-    const bc = params.blueCurve;
+    const mc = this.curve5(params.masterCurve, DEFAULT_CURVE);
+    const rc = this.curve5(params.redCurve, DEFAULT_CURVE);
+    const gc = this.curve5(params.greenCurve, DEFAULT_CURVE);
+    const bc = this.curve5(params.blueCurve, DEFAULT_CURVE);
 
     const data = new Float32Array([
       // Basic params (lutSize as u32 but we write as f32 bits)
@@ -178,36 +432,12 @@ export class LUTEngine {
   }
 
   generateLUT(params: FilterParams): void {
-    if (!this.device || !this.generatePipeline || !this.lutTexture) return;
+    if (!this.device || !this.generatePipeline || !this.lutTexture || !this.genUniformBuffer) return;
 
-    const uniformData = this.packUniforms(params);
-    const uniformBuffer = this.device.createBuffer({
-      size: uniformData.byteLength,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer as ArrayBuffer);
-
-    const bindGroup = this.device.createBindGroup({
-      layout: this.generatePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuffer } },
-        { binding: 1, resource: this.lutTexture.createView({ dimension: '3d' }) },
-      ],
-    });
-
+    this.writeGenUniforms(params);
     const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(this.generatePipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(
-      Math.ceil(this.lutSize / 4),
-      Math.ceil(this.lutSize / 4),
-      Math.ceil(this.lutSize / 4),
-    );
-    pass.end();
-
+    this.encodeGenerateLUTPass(encoder);
     this.device.queue.submit([encoder.finish()]);
-    uniformBuffer.destroy();
   }
 
   async applyToImage(
@@ -216,81 +446,34 @@ export class LUTEngine {
   ): Promise<ImageBitmap | null> {
     if (!this.device || !this.applyPipeline || !this.lutTexture || !this.sampler) return null;
 
-    // First generate the LUT
-    this.generateLUT(params);
-
     const width = imageBitmap.width;
     const height = imageBitmap.height;
 
-    // Create input texture from image
-    const inputTexture = this.device.createTexture({
-      size: [width, height],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-    });
+    if (!this.ensurePool(width, height) || !this.pooledOutput || !this.pooledReadBuffer) {
+      return null;
+    }
 
-    this.device.queue.copyExternalImageToTexture(
-      { source: imageBitmap },
-      { texture: inputTexture },
-      [width, height],
-    );
-
-    // Create output texture
-    const outputTexture = this.device.createTexture({
-      size: [width, height],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
-    });
-
-    const paramsBuffer = this.device.createBuffer({
-      size: 16, // 4 u32s
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(
-      paramsBuffer,
-      0,
-      new Uint32Array([width, height, this.lutSize, 0]).buffer as ArrayBuffer,
-    );
-
-    const bindGroup = this.device.createBindGroup({
-      layout: this.applyPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: paramsBuffer } },
-        { binding: 1, resource: inputTexture.createView() },
-        { binding: 2, resource: outputTexture.createView() },
-        { binding: 3, resource: this.lutTexture.createView({ dimension: '3d' }) },
-        { binding: 4, resource: this.sampler },
-      ],
-    });
+    this.writeGenUniforms(params);
+    if (!this.queueApplyInputUpload(imageBitmap, width, height)) return null;
 
     const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(this.applyPipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
-    pass.end();
+    this.encodeGenerateLUTPass(encoder);
+    if (!this.encodeApplyPass(encoder)) return null;
 
-    // Copy output to buffer for reading
     const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
-    const readBuffer = this.device.createBuffer({
-      size: bytesPerRow * height,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
 
     encoder.copyTextureToBuffer(
-      { texture: outputTexture },
-      { buffer: readBuffer, bytesPerRow },
+      { texture: this.pooledOutput },
+      { buffer: this.pooledReadBuffer, bytesPerRow },
       [width, height],
     );
 
     this.device.queue.submit([encoder.finish()]);
 
-    // Wait for completion and create ImageBitmap
-    await readBuffer.mapAsync(GPUMapMode.READ);
-    const mappedData = new Uint8Array(readBuffer.getMappedRange().slice(0));
-    readBuffer.unmap();
+    await this.pooledReadBuffer.mapAsync(GPUMapMode.READ);
+    const mappedData = new Uint8Array(this.pooledReadBuffer.getMappedRange().slice(0));
+    this.pooledReadBuffer.unmap();
 
-    // Strip padding from rows
     const data = new Uint8ClampedArray(width * height * 4);
     for (let y = 0; y < height; y++) {
       const srcOffset = y * bytesPerRow;
@@ -298,15 +481,8 @@ export class LUTEngine {
       data.set(mappedData.subarray(srcOffset, srcOffset + width * 4), dstOffset);
     }
 
-    // Create ImageData and then ImageBitmap
     const imageData = new ImageData(data, width, height);
     const bitmap = await createImageBitmap(imageData);
-
-    // Cleanup
-    inputTexture.destroy();
-    outputTexture.destroy();
-    paramsBuffer.destroy();
-    readBuffer.destroy();
 
     return bitmap;
   }
@@ -316,9 +492,6 @@ export class LUTEngine {
 
     // Generate the LUT first
     this.generateLUT(params);
-
-    const size = this.lutSize;
-    const totalEntries = size * size * size;
 
     // We need to copy the 3D texture to a buffer
     // Since we can't directly copy 3D textures to buffers in all implementations,
@@ -459,9 +632,9 @@ export class LUTEngine {
           g = Math.pow(Math.max(g * params.greenGain + params.greenLift, 0), 1 / Math.max(params.greenGamma, 0.01));
           b = Math.pow(Math.max(b * params.blueGain + params.blueLift, 0), 1 / Math.max(params.blueGamma, 0.01));
 
-          // Master curve
-          const m = this.sampleCurve(r, params.masterCurve);
+          // Master curve (sample at luminance so identity curve leaves RGB unchanged)
           const lumW = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          const m = this.sampleCurve(lumW, params.masterCurve);
           const masterEffect = m - lumW;
           r += masterEffect;
           g += masterEffect;
@@ -497,7 +670,7 @@ export class LUTEngine {
     const lutData = this.generateLUTCPU(params);
     const size = this.lutSize;
 
-    let lines: string[] = [];
+    const lines: string[] = [];
     lines.push(`TITLE "${title}"`);
     lines.push(``);
     lines.push(`# Created with LUT Studio`);
@@ -531,6 +704,11 @@ export class LUTEngine {
   }
 
   destroy(): void {
+    this.releasePool();
+    this.genUniformBuffer?.destroy();
+    this.applyUniformBuffer?.destroy();
+    this.genUniformBuffer = null;
+    this.applyUniformBuffer = null;
     this.lutTexture?.destroy();
     this.device?.destroy();
     this.device = null;

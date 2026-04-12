@@ -2,6 +2,7 @@
   "name": "lut-studio",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.3.12",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -11,6 +12,7 @@
   "dependencies": {
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "heic2any": "^0.0.4",
     "lucide-react": "^1.8.0",
     "next": "16.2.3",
     "radix-ui": "^1.4.3",

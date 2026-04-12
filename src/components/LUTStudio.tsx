@@ -1,19 +1,64 @@
 "use client";
 
-import { FilterParams, LUTEngine, freshParams, DEFAULT_PARAMS, DEFAULT_CURVE } from "@/lib/lut-engine";
+import { FilterParams, LUTEngine, freshParams } from "@/lib/lut-engine";
 import FilterPanel from "@/components/FilterPanel";
 import CurvesPanel from "@/components/CurvesPanel";
+import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { withBasePath } from "@/lib/base-path";
+import { cn } from "@/lib/utils";
+import { renderCpuLutCanvas } from "@/lib/cpu-lut-canvas";
+import { fileToImageObjectUrl, isHeicLike } from "@/lib/heic";
+import { Upload } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type Tab = "adjust" | "curves";
+
+const EXPORT_MAX_DIM = 8192;
+
+function getPreviewMaxDim(): number {
+  if (typeof window === "undefined") return 1920;
+  return window.innerWidth <= 767 ? 1024 : 1920;
+}
+
+function getPreviewDebounceMs(): number {
+  if (typeof window === "undefined") return 150;
+  return window.innerWidth <= 767 ? 220 : 150;
+}
+
+function canvasToBlobUrl(canvas: HTMLCanvasElement): Promise<string | null> {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        resolve(null);
+        return;
+      }
+      resolve(URL.createObjectURL(blob));
+    }, "image/png");
+  });
+}
+
+function bitmapToBlobUrl(bitmap: ImageBitmap): Promise<string | null> {
+  const c = document.createElement("canvas");
+  c.width = bitmap.width;
+  c.height = bitmap.height;
+  c.getContext("2d")!.drawImage(bitmap, 0, 0);
+  return canvasToBlobUrl(c);
+}
 
 export default function LUTStudio() {
   const [params, setParams] = useState<FilterParams>(freshParams());
   const [activeTab, setActiveTab] = useState<Tab>("adjust");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  /** WebGPU path: graded result is drawn to this canvas (no CPU readback). */
+  const [gpuPreviewReady, setGpuPreviewReady] = useState(false);
+  const previewUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    previewUrlRef.current = previewUrl;
+  }, [previewUrl]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
   const [engineReady, setEngineReady] = useState(false);
   const [useCPU, setUseCPU] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -21,25 +66,73 @@ export default function LUTStudio() {
   const [drawerSnap, setDrawerSnap] = useState<"peek" | "half" | "full">("half");
 
   const engineRef = useRef<LUTEngine | null>(null);
+  const gpuPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const debounceRef = useRef<NodeJS.Timeout | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const drawerStartY = useRef(0);
   const drawerCurrentTranslate = useRef(0);
 
-  // Initialize WebGPU engine
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+
+  const useCPURef = useRef(useCPU);
+  useCPURef.current = useCPU;
+
+  const isProcessingRef = useRef(false);
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
+
+  const pendingPreviewRef = useRef(false);
+  const imageObjectUrlRef = useRef<string | null>(null);
+
+  const loadImage = useCallback((src: string, options?: { resetParams?: boolean }) => {
+    if (imageObjectUrlRef.current?.startsWith("blob:")) {
+      URL.revokeObjectURL(imageObjectUrlRef.current);
+    }
+    imageObjectUrlRef.current = src.startsWith("blob:") ? src : null;
+
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      imageRef.current = img;
+      setImageUrl(src);
+      if (options?.resetParams) {
+        setParams(freshParams());
+      }
+      setGpuPreviewReady(false);
+      setPreviewUrl((prev) => {
+        if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+        return null;
+      });
+    };
+    img.onerror = () => {
+      console.error("Failed to decode image");
+    };
+    img.src = src;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      const u = previewUrlRef.current;
+      if (u?.startsWith("blob:")) URL.revokeObjectURL(u);
+      const imgUrl = imageObjectUrlRef.current;
+      if (imgUrl?.startsWith("blob:")) URL.revokeObjectURL(imgUrl);
+    };
+  }, []);
+
   useEffect(() => {
     const init = async () => {
       if (!navigator.gpu) {
-        setWebgpuSupported(false);
         setUseCPU(true);
+        setGpuPreviewReady(false);
         const engine = new LUTEngine();
         engineRef.current = engine;
         setEngineReady(true);
         return;
       }
-      setWebgpuSupported(true);
       const engine = new LUTEngine();
       const ok = await engine.init();
       if (ok) {
@@ -48,268 +141,257 @@ export default function LUTStudio() {
       } else {
         console.warn("WebGPU init failed, falling back to CPU processing");
         setUseCPU(true);
+        setGpuPreviewReady(false);
         const cpuEngine = new LUTEngine();
         engineRef.current = cpuEngine;
         setEngineReady(true);
       }
     };
-    init();
+    void init();
     return () => {
       engineRef.current?.destroy();
     };
   }, []);
 
-  // Load default sample image
   useEffect(() => {
-    loadImage("/sample.jpg");
+    loadImage(withBasePath("/sample.jpg"));
+  }, [loadImage]);
+
+  const updatePreview = useCallback(async () => {
+    if (!engineRef.current || !imageRef.current) return;
+    if (isProcessingRef.current) {
+      pendingPreviewRef.current = true;
+      return;
+    }
+
+    isProcessingRef.current = true;
+    setIsProcessing(true);
+    const p = paramsRef.current;
+    const img = imageRef.current;
+    const maxDim = getPreviewMaxDim();
+
+    try {
+      if (useCPURef.current) {
+        const canvas = renderCpuLutCanvas(img, p, maxDim, engineRef.current);
+        if (!canvas) return;
+        const url = await canvasToBlobUrl(canvas);
+        if (url) {
+          setPreviewUrl((prev) => {
+            if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+            return url;
+          });
+        }
+      } else {
+        const canvas = document.createElement("canvas");
+        let w = img.naturalWidth;
+        let h = img.naturalHeight;
+        if (Math.max(w, h) > maxDim) {
+          const scale = maxDim / Math.max(w, h);
+          w = Math.round(w * scale);
+          h = Math.round(h * scale);
+        }
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(img, 0, 0, w, h);
+
+        const bitmap = await createImageBitmap(canvas);
+        const engine = engineRef.current;
+        const surface = gpuPreviewCanvasRef.current;
+
+        if (surface && engine?.presentPreviewToCanvas(surface, bitmap, p)) {
+          bitmap.close();
+          setGpuPreviewReady(true);
+          setPreviewUrl((prev) => {
+            if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+            return null;
+          });
+        } else {
+          const result = await engine!.applyToImage(bitmap, p);
+          bitmap.close();
+          setGpuPreviewReady(false);
+
+          if (result) {
+            const url = await bitmapToBlobUrl(result);
+            result.close();
+            if (url) {
+              setPreviewUrl((prev) => {
+                if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+                return url;
+              });
+            }
+          } else {
+            console.warn("WebGPU applyToImage returned null, falling back to CPU");
+            setUseCPU(true);
+            setGpuPreviewReady(false);
+            const cpuCanvas = renderCpuLutCanvas(img, p, maxDim, engineRef.current!);
+            if (cpuCanvas) {
+              const url = await canvasToBlobUrl(cpuCanvas);
+              if (url) {
+                setPreviewUrl((prev) => {
+                  if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+                  return url;
+                });
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error("Preview error:", err);
+      if (!useCPURef.current) {
+        console.warn("WebGPU error, falling back to CPU");
+        setUseCPU(true);
+        setGpuPreviewReady(false);
+        const cpuCanvas = renderCpuLutCanvas(img, p, maxDim, engineRef.current!);
+        if (cpuCanvas) {
+          const url = await canvasToBlobUrl(cpuCanvas);
+          if (url) {
+            setPreviewUrl((prev) => {
+              if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+              return url;
+            });
+          }
+        }
+      }
+    } finally {
+      isProcessingRef.current = false;
+      setIsProcessing(false);
+      if (pendingPreviewRef.current) {
+        pendingPreviewRef.current = false;
+        void updatePreview();
+      }
+    }
   }, []);
 
-  // Debounced preview update
   useEffect(() => {
     if (!engineReady || !imageRef.current) return;
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
     debounceRef.current = setTimeout(() => {
-      updatePreview();
-    }, 150);
+      void updatePreview();
+    }, getPreviewDebounceMs());
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [params, engineReady, imageUrl]);
+  }, [params, engineReady, imageUrl, updatePreview]);
 
-  const loadImage = useCallback((src: string) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      imageRef.current = img;
-      setImageUrl(src);
-      setPreviewUrl(null);
-    };
-    img.src = src;
-  }, []);
-
-  const applyToImageCPU = useCallback((img: HTMLImageElement, params: FilterParams): string | null => {
-    const engine = engineRef.current;
-    if (!engine) return null;
-
-    const canvas = document.createElement("canvas");
-    const maxDim = 2048;
-    let w = img.naturalWidth;
-    let h = img.naturalHeight;
-    if (w > maxDim || h > maxDim) {
-      const scale = maxDim / Math.max(w, h);
-      w = Math.round(w * scale);
-      h = Math.round(h * scale);
-    }
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(img, 0, 0, w, h);
-
-    const imageData = ctx.getImageData(0, 0, w, h);
-    const data = imageData.data;
-
-    const lutData = engine.generateLUTCPU(params);
-    const lutSize = 32;
-    const lutMax = lutSize - 1;
-
-    for (let i = 0; i < data.length; i += 4) {
-      const rIn = data[i] / 255;
-      const gIn = data[i + 1] / 255;
-      const bIn = data[i + 2] / 255;
-
-      const rF = rIn * lutMax;
-      const gF = gIn * lutMax;
-      const bF = bIn * lutMax;
-
-      const r0 = Math.floor(rF); const r1 = Math.min(r0 + 1, lutMax);
-      const g0 = Math.floor(gF); const g1 = Math.min(g0 + 1, lutMax);
-      const b0 = Math.floor(bF); const b1 = Math.min(b0 + 1, lutMax);
-
-      const rD = rF - r0; const gD = gF - g0; const bD = bF - b0;
-
-      const idx = (bz: number, gz: number, rz: number) => (bz * lutSize * lutSize + gz * lutSize + rz) * 3;
-
-      const sample = (bz: number, gz: number, rz: number) => {
-        const j = idx(bz, gz, rz);
-        return [lutData[j], lutData[j + 1], lutData[j + 2]];
-      };
-
-      const c000 = sample(b0, g0, r0);
-      const c100 = sample(b1, g0, r0);
-      const c010 = sample(b0, g1, r0);
-      const c110 = sample(b1, g1, r0);
-      const c001 = sample(b0, g0, r1);
-      const c101 = sample(b1, g0, r1);
-      const c011 = sample(b0, g1, r1);
-      const c111 = sample(b1, g1, r1);
-
-      const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-
-      for (let c = 0; c < 3; c++) {
-        const c00 = lerp(c000[c], c001[c], rD);
-        const c01 = lerp(c010[c], c011[c], rD);
-        const c10 = lerp(c100[c], c101[c], rD);
-        const c11 = lerp(c110[c], c111[c], rD);
-        const c0f = lerp(c00, c10, bD);
-        const c1f = lerp(c01, c11, bD);
-        const val = lerp(c0f, c1f, gD);
-        data[i + c] = Math.round(Math.max(0, Math.min(1, val)) * 255);
-      }
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-    return canvas.toDataURL("image/png");
-  }, []);
-
-  const updatePreview = useCallback(async () => {
-    if (!engineRef.current || !imageRef.current || isProcessing) return;
-
-    setIsProcessing(true);
-    try {
-      const img = imageRef.current;
-
-      if (useCPU) {
-        const result = applyToImageCPU(img, params);
-        if (result) {
-          setPreviewUrl(result);
-        }
-      } else {
-        const canvas = document.createElement("canvas");
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext("2d")!;
-        ctx.drawImage(img, 0, 0);
-
-        const bitmap = await createImageBitmap(canvas);
-        const result = await engineRef.current.applyToImage(bitmap, params);
-
-        if (result) {
-          const resultCanvas = document.createElement("canvas");
-          resultCanvas.width = result.width;
-          resultCanvas.height = result.height;
-          const rctx = resultCanvas.getContext("2d")!;
-          rctx.drawImage(result, 0, 0);
-          setPreviewUrl(resultCanvas.toDataURL("image/png"));
-          result.close();
-        } else {
-          console.warn("WebGPU applyToImage returned null, falling back to CPU");
-          setUseCPU(true);
-          const cpuResult = applyToImageCPU(img, params);
-          if (cpuResult) {
-            setPreviewUrl(cpuResult);
-          }
-        }
-        bitmap.close();
-      }
-    } catch (err) {
-      console.error("Preview error:", err);
-      if (!useCPU) {
-        console.warn("WebGPU error, falling back to CPU");
-        setUseCPU(true);
-        const cpuResult = applyToImageCPU(imageRef.current!, params);
-        if (cpuResult) {
-          setPreviewUrl(cpuResult);
-        }
-      }
-    } finally {
-      setIsProcessing(false);
-    }
-  }, [params, isProcessing, useCPU, applyToImageCPU]);
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    loadImage(url);
     e.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/") && !isHeicLike(file)) return;
+    try {
+      const url = await fileToImageObjectUrl(file);
+      loadImage(url, { resetParams: true });
+    } catch (err) {
+      console.error("Failed to load image:", err);
+    }
   };
 
-  // iOS Safari: must use native click, not React synthetic
   const triggerFileInput = () => {
     const input = fileInputRef.current;
     if (!input) return;
-    // Reset to allow re-upload
     input.value = "";
     input.click();
   };
 
-  const handleDrop = (e: React.DragEvent) => {
+  const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) {
-      const url = URL.createObjectURL(file);
-      loadImage(url);
+    if (!file) return;
+    if (!file.type.startsWith("image/") && !isHeicLike(file)) return;
+    try {
+      const url = await fileToImageObjectUrl(file);
+      loadImage(url, { resetParams: true });
+    } catch (err) {
+      console.error("Failed to load image:", err);
     }
   };
 
+  const waitForIdle = useCallback(() => {
+    return new Promise<void>((resolve) => {
+      const start = Date.now();
+      const check = () => {
+        if (!isProcessingRef.current) {
+          resolve();
+          return;
+        }
+        if (Date.now() - start > 10000) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 50);
+      };
+      check();
+    });
+  }, []);
+
+  const renderFullExportBlob = useCallback(async (): Promise<Blob | null> => {
+    const img = imageRef.current;
+    const engine = engineRef.current;
+    if (!img || !engine) return null;
+    const p = paramsRef.current;
+
+    if (!useCPURef.current) {
+      const canvas = document.createElement("canvas");
+      let w = img.naturalWidth;
+      let h = img.naturalHeight;
+      if (Math.max(w, h) > EXPORT_MAX_DIM) {
+        const scale = EXPORT_MAX_DIM / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(img, 0, 0, w, h);
+      const bitmap = await createImageBitmap(canvas);
+      const result = await engine.applyToImage(bitmap, p);
+      bitmap.close();
+      if (result) {
+        const c = document.createElement("canvas");
+        c.width = result.width;
+        c.height = result.height;
+        c.getContext("2d")!.drawImage(result, 0, 0);
+        result.close();
+        return await new Promise((resolve) => {
+          c.toBlob((blob) => resolve(blob), "image/png");
+        });
+      }
+    }
+
+    const cpuCanvas = renderCpuLutCanvas(img, p, EXPORT_MAX_DIM, engine);
+    if (!cpuCanvas) return null;
+    return await new Promise((resolve) => {
+      cpuCanvas.toBlob((blob) => resolve(blob), "image/png");
+    });
+  }, []);
+
   const handleExportCube = async () => {
     if (!engineRef.current) return;
-    
-    if (isProcessing) {
-      await new Promise<void>((resolve) => {
-        const check = () => {
-          if (!isProcessing) { resolve(); return; }
-          setTimeout(check, 50);
-        };
-        setTimeout(() => resolve(), 10000);
-        check();
-      });
-    }
-    
-    const cubeContent = engineRef.current.exportCube(params, "LUT Studio Filter");
+    await waitForIdle();
+    const cubeContent = engineRef.current.exportCube(paramsRef.current, "LUT Studio Filter");
     const blob = new Blob([cubeContent], { type: "text/plain" });
     downloadBlob(blob, "lut-studio-filter.cube");
   };
 
   const handleSaveImage = async () => {
-    if (!previewUrl || !imageRef.current) return;
-    
-    if (isProcessing) {
-      await new Promise<void>((resolve) => {
-        const check = () => {
-          if (!isProcessing) { resolve(); return; }
-          setTimeout(check, 50);
-        };
-        setTimeout(() => resolve(), 10000);
-        check();
-      });
-    }
-    
-    const img = imageRef.current;
-    const canvas = document.createElement("canvas");
-    canvas.width = img.naturalWidth;
-    canvas.height = img.naturalHeight;
-    const ctx = canvas.getContext("2d")!;
-    
-    const previewImg = new window.Image();
-    previewImg.crossOrigin = "anonymous";
-    await new Promise<void>((resolve, reject) => {
-      previewImg.onload = () => resolve();
-      previewImg.onerror = reject;
-      previewImg.src = previewUrl;
-    });
-    ctx.drawImage(previewImg, 0, 0);
-    
-    canvas.toBlob((blob) => {
-      if (!blob) return;
-      downloadBlob(blob, "lut-studio-edited.png");
-    }, "image/png");
+    if (!imageRef.current || !engineRef.current) return;
+    await waitForIdle();
+    const blob = await renderFullExportBlob();
+    if (blob) downloadBlob(blob, "lut-studio-edited.png");
   };
 
-  /** Cross-platform download — works on iOS Safari */
   const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
-    // iOS Safari: open in new tab (user can then save/share)
-    // Desktop: triggers download via anchor
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
     if (isIOS) {
       const win = window.open(url, "_blank");
       if (!win) {
-        // Popup blocked — fallback to anchor with download attr
         const a = document.createElement("a");
         a.href = url;
         a.download = filename;
@@ -328,7 +410,12 @@ export default function LUTStudio() {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
-  // Drawer swipe handling
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    document.body.classList.toggle("drawer-open", drawerOpen);
+    return () => document.body.classList.remove("drawer-open");
+  }, [drawerOpen]);
+
   const handleDrawerTouchStart = (e: React.TouchEvent) => {
     drawerStartY.current = e.touches[0].clientY;
   };
@@ -337,10 +424,9 @@ export default function LUTStudio() {
     if (!drawerRef.current) return;
     const deltaY = e.touches[0].clientY - drawerStartY.current;
     drawerCurrentTranslate.current = deltaY;
-    
+
     const drawer = drawerRef.current;
     if (deltaY > 0) {
-      // Swiping down — apply transform
       drawer.style.transform = `translateY(${deltaY}px)`;
     }
   };
@@ -349,11 +435,10 @@ export default function LUTStudio() {
     if (!drawerRef.current) return;
     const drawer = drawerRef.current;
     drawer.style.transform = "";
-    
+
     const delta = drawerCurrentTranslate.current;
-    
+
     if (delta > 80) {
-      // Swipe down significant — go to previous snap or close
       if (drawerSnap === "full") {
         setDrawerSnap("half");
       } else if (drawerSnap === "half") {
@@ -362,14 +447,13 @@ export default function LUTStudio() {
         setDrawerOpen(false);
       }
     } else if (delta < -80) {
-      // Swipe up — expand
       if (drawerSnap === "peek") {
         setDrawerSnap("half");
       } else if (drawerSnap === "half") {
         setDrawerSnap("full");
       }
     }
-    
+
     drawerCurrentTranslate.current = 0;
   };
 
@@ -379,303 +463,260 @@ export default function LUTStudio() {
     setDrawerSnap("half");
   };
 
-  if (webgpuSupported === false && !useCPU) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <div className="text-center space-y-4 p-8">
-          <div className="text-5xl">🚫</div>
-          <h1 className="text-xl font-semibold text-foreground">
-            WebGPU Not Supported
-          </h1>
-          <p className="text-sm text-zinc-500 max-w-md">
-            LUT Studio requires WebGPU. Please use a modern browser (Chrome 113+, Edge 113+, or Safari 18+).
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const tabBar = (
+    <Tabs
+      value={activeTab}
+      onValueChange={(v) => setActiveTab(v as Tab)}
+      className="flex h-full min-h-0 flex-1 flex-col gap-0"
+    >
+      <TabsList variant="line" className="h-10 w-full shrink-0 justify-stretch rounded-none border-b border-border bg-transparent p-0">
+        <TabsTrigger value="adjust" className="flex-1 rounded-none">
+          Adjust
+        </TabsTrigger>
+        <TabsTrigger value="curves" className="flex-1 rounded-none">
+          Curves
+        </TabsTrigger>
+      </TabsList>
+      <TabsContent value="adjust" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
+        <FilterPanel params={params} onChange={setParams} />
+      </TabsContent>
+      <TabsContent value="curves" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
+        <CurvesPanel params={params} onChange={setParams} />
+      </TabsContent>
+    </Tabs>
+  );
+
+  const exportActions = (
+    <div className="flex flex-col gap-2 border-t border-border p-4">
+      <Button
+        type="button"
+        variant="secondary"
+        className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
+        disabled={(!previewUrl && !gpuPreviewReady) || isProcessing}
+        aria-busy={isProcessing}
+        onClick={() => void handleSaveImage()}
+      >
+        <span className="inline-flex items-center gap-2">
+          {isProcessing ? <Spinner className="size-4" /> : null}
+          Save image
+        </span>
+      </Button>
+      <Button type="button" disabled={!engineReady || isProcessing} aria-busy={isProcessing} onClick={() => void handleExportCube()}>
+        <span className="inline-flex items-center gap-2">
+          {isProcessing ? <Spinner className="size-4" /> : null}
+          Export .cube
+        </span>
+      </Button>
+    </div>
+  );
 
   return (
-    <div className="flex h-dvh bg-background overflow-hidden md:h-screen">
-      {/* Shared hidden file input */}
+    <div className="flex h-dvh overflow-hidden bg-background md:h-screen">
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,.heic,.heif"
         onChange={handleFileUpload}
-        style={{ position: "fixed", top: "-9999px", left: "-9999px", opacity: 0, width: 1, height: 1 }}
+        className="pointer-events-none fixed top-[-9999px] left-[-9999px] h-px w-px opacity-0"
+        aria-hidden
+        tabIndex={-1}
       />
 
-      {/* ========== DESKTOP SIDEBAR (>=768px) ========== */}
-      <div className="hidden md:flex w-80 shrink-0 flex-col border-r border-border bg-surface">
-        {/* Tabs */}
-        <div className="flex border-b border-border">
-          <button
-            onClick={() => setActiveTab("adjust")}
-            className={`flex-1 py-3 text-xs font-semibold uppercase tracking-wider transition-colors ${
-              activeTab === "adjust"
-                ? "text-accent border-b-2 border-accent"
-                : "text-zinc-600 hover:text-zinc-400"
-            }`}
-          >
-            Adjust
-          </button>
-          <button
-            onClick={() => setActiveTab("curves")}
-            className={`flex-1 py-3 text-xs font-semibold uppercase tracking-wider transition-colors ${
-              activeTab === "curves"
-                ? "text-accent border-b-2 border-accent"
-                : "text-zinc-600 hover:text-zinc-400"
-            }`}
-          >
-            Curves
-          </button>
-        </div>
-
-        {/* Panel */}
-        <div className="flex-1 overflow-hidden">
-          {activeTab === "adjust" ? (
-            <FilterPanel params={params} onChange={setParams} />
-          ) : (
-            <CurvesPanel params={params} onChange={setParams} />
-          )}
-        </div>
-
-        {/* Export buttons */}
-        <div className="p-4 border-t border-border space-y-2">
-          <button
-            onClick={handleSaveImage}
-            disabled={!previewUrl || isProcessing}
-            className="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors"
-          >
-            {isProcessing ? "⏳ Processing…" : "💾 Save Image"}
-          </button>
-          <button
-            onClick={handleExportCube}
-            disabled={!engineReady || isProcessing}
-            className="w-full py-2.5 rounded-lg bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold transition-colors"
-          >
-            {isProcessing ? "⏳ Processing…" : "↓ Export .cube"}
-          </button>
-        </div>
+      <div className="bg-surface hidden h-dvh min-h-0 w-80 shrink-0 flex-col border-r border-border md:flex">
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{tabBar}</div>
+        {exportActions}
       </div>
 
-      {/* ========== MAIN PREVIEW ========== */}
       <div
-        className="flex-1 flex flex-col relative"
-        onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+        className="relative flex flex-1 flex-col"
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
       >
-        {/* Top bar — desktop */}
-        <div className="hidden md:flex items-center justify-between px-6 py-3 border-b border-border">
+        <div className="hidden items-center justify-between border-b border-border px-6 py-3 md:flex">
           <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-accent animate-pulse" />
-            <h1 className="text-sm font-semibold tracking-tight">
-              LUT Studio
-            </h1>
-            <span className="text-[10px] text-zinc-600 font-mono">
-              {useCPU ? "CPU" : "WebGPU"}
-            </span>
+            <div className="bg-primary size-2 animate-pulse rounded-full" />
+            <h1 className="text-sm font-semibold tracking-tight">LUT Studio</h1>
+            <span className="font-mono text-[10px] text-muted-foreground">{useCPU ? "CPU" : "WebGPU"}</span>
           </div>
           <div className="flex items-center gap-3">
-            <button
-              onClick={triggerFileInput}
-              className="px-3 py-1.5 text-xs font-medium rounded-md bg-surface hover:bg-surface-hover text-zinc-400 hover:text-zinc-200 border border-border transition-all"
-            >
-              Upload Image
-            </button>
-            {isProcessing && (
-              <span className="text-[10px] text-zinc-600 animate-pulse">Processing…</span>
-            )}
+            <Button type="button" variant="outline" size="sm" onClick={triggerFileInput} aria-label="Upload image">
+              Upload image
+            </Button>
+            {isProcessing ? (
+              <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                <Spinner className="size-3" />
+                Processing
+              </span>
+            ) : null}
           </div>
         </div>
 
-        {/* Mobile top bar */}
-        <div className="flex md:hidden items-center justify-between px-4 py-2 bg-background/80 backdrop-blur-sm z-10 absolute top-0 left-0 right-0">
+        <div className="safe-area-top bg-background/80 absolute top-0 right-0 left-0 z-10 flex items-center justify-between px-4 py-2 backdrop-blur-sm md:hidden">
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+            <div className="bg-primary size-1.5 animate-pulse rounded-full" />
             <h1 className="text-xs font-semibold tracking-tight">LUT Studio</h1>
-            <span className="text-[9px] text-zinc-600 font-mono">
-              {useCPU ? "CPU" : "GPU"}
-            </span>
+            <span className="font-mono text-[9px] text-muted-foreground">{useCPU ? "CPU" : "GPU"}</span>
           </div>
           <div className="flex items-center gap-2">
-            <button
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
               onClick={triggerFileInput}
-              className="p-2 rounded-lg bg-surface/80 text-zinc-400 hover:text-zinc-200 border border-border transition-all"
-              title="Upload Image"
+              aria-label="Upload image"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
-            </button>
-            {isProcessing && (
-              <span className="text-[9px] text-zinc-600 animate-pulse">Processing…</span>
-            )}
+              <Upload />
+            </Button>
+            {isProcessing ? (
+              <span className="flex items-center gap-1 text-[9px] text-muted-foreground">
+                <Spinner className="size-3" />
+                Processing
+              </span>
+            ) : null}
           </div>
         </div>
 
-        {/* Preview area */}
-        <div className="flex-1 flex items-center justify-center p-4 pt-12 md:p-8 md:pt-8 relative">
-          {isDragging && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/80 border-2 border-dashed border-accent rounded-lg">
-              <span className="text-sm text-accent font-medium">Drop image here</span>
+        <div className="relative flex flex-1 items-center justify-center p-4 pt-14 md:p-8 md:pt-8">
+          {isDragging ? (
+            <div className="border-primary bg-background/80 absolute inset-0 z-10 flex items-center justify-center rounded-lg border-2 border-dashed">
+              <span className="text-primary text-sm font-medium">Drop image here</span>
             </div>
-          )}
+          ) : null}
 
           {!imageUrl && !previewUrl ? (
-            <div
+            <button
+              type="button"
               onClick={triggerFileInput}
-              className="flex flex-col items-center gap-4 cursor-pointer group"
+              className="group flex cursor-pointer flex-col items-center gap-4 border-0 bg-transparent p-4 text-left"
+              aria-label="Upload an image"
             >
-              <div className="w-20 h-20 rounded-2xl bg-surface border-2 border-dashed border-border group-hover:border-accent transition-colors flex items-center justify-center text-3xl">
-                📷
+              <div className="border-border group-hover:border-primary flex size-20 items-center justify-center rounded-2xl border-2 border-dashed bg-surface text-3xl transition-colors">
+                <Upload className="text-muted-foreground group-hover:text-foreground size-8" aria-hidden />
               </div>
               <div className="text-center">
-                <p className="text-sm text-zinc-400 group-hover:text-zinc-200 transition-colors">
-                  Drop an image or click to upload
+                <p className="text-muted-foreground group-hover:text-foreground text-sm transition-colors">
+                  Drop an image or tap to upload
                 </p>
-                <p className="text-[11px] text-zinc-600 mt-1">
-                  JPG, PNG, WebP supported
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  JPG, PNG, WebP, HEIC supported
                 </p>
               </div>
-            </div>
+            </button>
           ) : (
-            <div className="relative max-w-full max-h-full">
+            <div className="relative max-h-full max-w-full">
+              {!useCPU && imageUrl ? (
+                <canvas
+                  ref={gpuPreviewCanvasRef}
+                  className={cn(
+                    "max-h-[calc(100dvh-120px)] max-w-full rounded-lg shadow-2xl md:max-h-[calc(100vh-120px)]",
+                    gpuPreviewReady ? "block" : "hidden",
+                  )}
+                  aria-hidden={!gpuPreviewReady}
+                />
+              ) : null}
               {previewUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element -- blob/data URLs and live preview
                 <img
                   src={previewUrl}
-                  alt="Preview"
-                  className="max-w-full max-h-[calc(100dvh-120px)] md:max-h-[calc(100vh-120px)] object-contain rounded-lg shadow-2xl"
+                  alt="Color graded preview"
+                  className={cn(
+                    "max-h-[calc(100dvh-120px)] max-w-full rounded-lg object-contain shadow-2xl md:max-h-[calc(100vh-120px)]",
+                    gpuPreviewReady && !useCPU && "hidden",
+                  )}
                 />
-              ) : imageUrl ? (
+              ) : null}
+              {!previewUrl && imageUrl && !(gpuPreviewReady && !useCPU) ? (
+                // eslint-disable-next-line @next/next/no-img-element -- user uploads and object URLs
                 <img
                   src={imageUrl}
                   alt="Original"
-                  className="max-w-full max-h-[calc(100dvh-120px)] md:max-h-[calc(100vh-120px)] object-contain rounded-lg shadow-2xl opacity-60"
+                  className="max-h-[calc(100dvh-120px)] max-w-full rounded-lg object-contain opacity-60 shadow-2xl md:max-h-[calc(100vh-120px)]"
                 />
               ) : null}
             </div>
           )}
         </div>
 
-        {/* ========== MOBILE BOTTOM TAB BAR (<768px) ========== */}
-        <div className="flex md:hidden items-stretch border-t border-border bg-surface/95 backdrop-blur-md safe-area-bottom">
+        <div className="safe-area-bottom bg-surface/95 flex items-stretch border-t border-border backdrop-blur-md md:hidden">
           <button
+            type="button"
             onClick={() => openDrawerWithTab("adjust")}
-            className={`flex-1 flex flex-col items-center justify-center py-2.5 gap-0.5 transition-colors ${
-              drawerOpen && activeTab === "adjust"
-                ? "text-accent"
-                : "text-zinc-500"
+            className={`flex flex-1 flex-col items-center justify-center gap-0.5 py-2.5 transition-colors ${
+              drawerOpen && activeTab === "adjust" ? "text-primary" : "text-muted-foreground"
             }`}
+            aria-label="Open adjustments"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="3" />
-              <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
-            </svg>
             <span className="text-[10px] font-medium">Adjust</span>
           </button>
 
-          {/* Export buttons inline on mobile */}
           <div className="flex items-center gap-1 px-2">
-            <button
-              onClick={handleSaveImage}
-              disabled={!previewUrl || isProcessing}
-              className="px-3 py-2 rounded-lg bg-emerald-600 disabled:opacity-40 text-white text-[11px] font-semibold transition-colors"
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              className="bg-emerald-600 text-white hover:bg-emerald-500"
+              disabled={(!previewUrl && !gpuPreviewReady) || isProcessing}
+              aria-label="Save edited image"
+              onClick={() => void handleSaveImage()}
             >
-              💾
-            </button>
-            <button
-              onClick={handleExportCube}
+              Save
+            </Button>
+            <Button
+              type="button"
+              size="sm"
               disabled={!engineReady || isProcessing}
-              className="px-3 py-2 rounded-lg bg-accent disabled:opacity-40 text-white text-[11px] font-semibold transition-colors"
+              aria-label="Export cube LUT file"
+              onClick={() => void handleExportCube()}
             >
               .cube
-            </button>
+            </Button>
           </div>
 
           <button
+            type="button"
             onClick={() => openDrawerWithTab("curves")}
-            className={`flex-1 flex flex-col items-center justify-center py-2.5 gap-0.5 transition-colors ${
-              drawerOpen && activeTab === "curves"
-                ? "text-accent"
-                : "text-zinc-500"
+            className={`flex flex-1 flex-col items-center justify-center gap-0.5 py-2.5 transition-colors ${
+              drawerOpen && activeTab === "curves" ? "text-primary" : "text-muted-foreground"
             }`}
+            aria-label="Open curves"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M3 20 Q 9 4, 12 12 T 21 4" />
-            </svg>
             <span className="text-[10px] font-medium">Curves</span>
           </button>
         </div>
 
-        {/* ========== MOBILE DRAWER OVERLAY ========== */}
-        {drawerOpen && (
-          <div
-            className="md:hidden fixed inset-0 z-40"
-            onClick={() => setDrawerOpen(false)}
-          >
+        {drawerOpen ? (
+          <div className="fixed inset-0 z-40 md:hidden" onClick={() => setDrawerOpen(false)} aria-hidden>
             <div className="absolute inset-0 bg-black/40" />
           </div>
-        )}
+        ) : null}
 
-        {/* ========== MOBILE DRAWER PANEL ========== */}
         <div
           ref={drawerRef}
-          className={`md:hidden fixed left-0 right-0 z-50 bg-surface border-t border-border rounded-t-2xl shadow-2xl transition-transform duration-300 ease-out flex flex-col ${
-            drawerOpen ? "" : "translate-y-full pointer-events-none"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Editing controls"
+          className={`bg-surface fixed right-0 left-0 z-50 flex flex-col rounded-t-2xl border-t border-border shadow-2xl transition-transform duration-300 ease-out md:hidden ${
+            drawerOpen ? "" : "pointer-events-none translate-y-full"
           } ${
-            drawerSnap === "peek" ? "drawer-peek" :
-            drawerSnap === "half" ? "drawer-half" :
-            "drawer-full"
+            drawerSnap === "peek" ? "drawer-peek" : drawerSnap === "half" ? "drawer-half" : "drawer-full"
           }`}
           style={{ bottom: 0, top: drawerSnap === "full" ? "48px" : "auto" }}
+          onClick={(e) => e.stopPropagation()}
         >
-          {/* Drawer handle */}
           <div
-            className="flex justify-center py-2 cursor-grab active:cursor-grabbing shrink-0"
+            className="shrink-0 touch-none py-2"
+            style={{ touchAction: "none" }}
             onTouchStart={handleDrawerTouchStart}
             onTouchMove={handleDrawerTouchMove}
             onTouchEnd={handleDrawerTouchEnd}
           >
-            <div className="w-10 h-1 rounded-full bg-zinc-600" />
+            <div className="mx-auto h-1 w-10 rounded-full bg-muted" />
           </div>
-
-          {/* Drawer tab header */}
-          <div className="flex border-b border-border shrink-0">
-            <button
-              onClick={() => setActiveTab("adjust")}
-              className={`flex-1 py-2.5 text-xs font-semibold uppercase tracking-wider transition-colors ${
-                activeTab === "adjust"
-                  ? "text-accent border-b-2 border-accent"
-                  : "text-zinc-600"
-              }`}
-            >
-              Adjust
-            </button>
-            <button
-              onClick={() => setActiveTab("curves")}
-              className={`flex-1 py-2.5 text-xs font-semibold uppercase tracking-wider transition-colors ${
-                activeTab === "curves"
-                  ? "text-accent border-b-2 border-accent"
-                  : "text-zinc-600"
-              }`}
-            >
-              Curves
-            </button>
-          </div>
-
-          {/* Drawer content */}
-          <div className="flex-1 overflow-y-auto overscroll-contain">
-            {activeTab === "adjust" ? (
-              <FilterPanel params={params} onChange={setParams} />
-            ) : (
-              <CurvesPanel params={params} onChange={setParams} />
-            )}
-          </div>
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{tabBar}</div>
         </div>
       </div>
     </div>

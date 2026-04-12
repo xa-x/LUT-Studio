@@ -1,6 +1,7 @@
 "use client";
 
-import { FilterParams, freshParams, DEFAULT_CURVE } from "@/lib/lut-engine";
+import { FilterParams, freshParams } from "@/lib/lut-engine";
+import { Button } from "@/components/ui/button";
 import CurveEditor from "./CurveEditor";
 
 interface CurvesPanelProps {
@@ -18,30 +19,20 @@ const CURVES: { key: CurveKey; label: string; color: string }[] = [
 ];
 
 export default function CurvesPanel({ params, onChange }: CurvesPanelProps) {
-  const resetCurve = (key: CurveKey) => {
-    onChange({ ...params, [key]: DEFAULT_CURVE.map(p => ({ ...p })) });
-  };
-
   const resetAll = () => {
     onChange(freshParams());
   };
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="hidden md:flex items-center justify-between p-4 border-b border-border">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          Curves
-        </h3>
-        <button
-          onClick={resetAll}
-          className="text-[11px] text-zinc-600 hover:text-accent transition-colors"
-        >
-          Reset All
-        </button>
+    <div className="flex h-full flex-col">
+      <div className="hidden items-center justify-between border-b border-border p-4 md:flex">
+        <h3 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">Curves</h3>
+        <Button type="button" variant="ghost" size="xs" onClick={resetAll} className="text-muted-foreground">
+          Reset all
+        </Button>
       </div>
-      <div className="flex-1 overflow-y-auto p-3 md:p-4 overscroll-contain">
-        {/* On mobile: single column (each editor gets full width). On desktop: 2-col grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4">
+      <div className="flex-1 overflow-y-auto overscroll-contain p-3 md:p-4">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 md:gap-4">
           {CURVES.map(({ key, label, color }) => (
             <div key={key} className="w-full">
               <CurveEditor

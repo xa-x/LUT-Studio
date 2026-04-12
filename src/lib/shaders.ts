@@ -1,3 +1,34 @@
+/** Fullscreen triangle blit: sample filtered texture to swapchain (no CPU readback). */
+export const LUT_BLIT_SHADER = /* wgsl */`
+@group(0) @binding(0) var previewTex: texture_2d<f32>;
+@group(0) @binding(1) var previewSamp: sampler;
+
+struct VSOut {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f(3.0, -1.0),
+    vec2f(-1.0, 3.0)
+  );
+  let p = pos[vi];
+  var o: VSOut;
+  o.position = vec4f(p, 0.0, 1.0);
+  let uv = p * 0.5 + vec2f(0.5);
+  o.uv = vec2f(uv.x, 1.0 - uv.y);
+  return o;
+}
+
+@fragment
+fn fs_main(in: VSOut) -> @location(0) vec4f {
+  return textureSample(previewTex, previewSamp, in.uv);
+}
+`;
+
 // WGSL shader for applying LUT to an image
 export const LUT_APPLY_SHADER = /* wgsl */`
 struct Params {
@@ -282,16 +313,15 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   g = pow(max(g * params.greenGain + params.greenLift, 0.0), 1.0 / max(params.greenGamma, 0.01));
   b = pow(max(b * params.blueGain + params.blueLift, 0.0), 1.0 / max(params.blueGamma, 0.01));
 
-  // 11. Master curve
-  let m = sampleCurve(r,
+  // 11. Master curve (sample at luminance so identity curve y=x leaves RGB unchanged)
+  let lumW = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  let m = sampleCurve(lumW,
     params.masterCurveX0, params.masterCurveY0,
     params.masterCurveX1, params.masterCurveY1,
     params.masterCurveX2, params.masterCurveY2,
     params.masterCurveX3, params.masterCurveY3,
     params.masterCurveX4, params.masterCurveY4,
   );
-  // Apply master to luminance-weighted
-  let lumW = 0.2126 * r + 0.7152 * g + 0.0722 * b;
   let masterEffect = m - lumW;
   r += masterEffect;
   g += masterEffect;

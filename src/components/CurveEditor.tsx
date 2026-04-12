@@ -1,6 +1,7 @@
 "use client";
 
 import { DEFAULT_CURVE } from "@/lib/lut-engine";
+import { Button } from "@/components/ui/button";
 import { useEffect, useRef, useState } from "react";
 
 interface CurveEditorProps {
@@ -79,15 +80,16 @@ export default function CurveEditor({
   return (
     <div className="space-y-1" ref={containerRef}>
       <div className="flex items-center justify-between">
-        <span className="text-xs font-medium text-zinc-400">{label}</span>
-        <button
-          onClick={() =>
-            onChange(DEFAULT_CURVE.map(p => ({ ...p })))
-          }
-          className="text-[10px] text-zinc-600 hover:text-accent transition-colors py-1 px-2"
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="text-muted-foreground"
+          onClick={() => onChange(DEFAULT_CURVE.map((p) => ({ ...p })))}
         >
           Reset
-        </button>
+        </Button>
       </div>
       <svg
         width={svgSize}
@@ -142,19 +144,18 @@ function DraggablePoint({
   color: string;
   onDrag: (clientX: number, clientY: number, svg: SVGSVGElement | null) => void;
 }) {
-  let svgRef: SVGSVGElement | null = null;
+  const svgRef = useRef<SVGSVGElement | null>(null);
 
   const handleDown = (e: React.PointerEvent<SVGGElement>) => {
     e.preventDefault();
     e.stopPropagation();
     (e.target as Element).setPointerCapture(e.pointerId);
-    const svg = (e.target as Element).closest("svg");
-    svgRef = svg;
+    svgRef.current = (e.target as Element).closest("svg");
   };
 
   const handleMove = (e: React.PointerEvent<SVGGElement>) => {
     if (e.buttons > 0) {
-      onDrag(e.clientX, e.clientY, svgRef);
+      onDrag(e.clientX, e.clientY, svgRef.current);
     }
   };
 

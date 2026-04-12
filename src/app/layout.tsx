@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { cn } from "@/lib/utils";
@@ -20,6 +20,12 @@ export const metadata: Metadata = {
   description: "Create and export 3D LUT color filters with real-time WebGPU preview",
 };
 
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -28,7 +34,14 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={cn("h-full", "antialiased", geistSans.variable, geistMono.variable, "font-mono", jetbrainsMono.variable)}
+      className={cn(
+        "dark h-full",
+        "antialiased",
+        geistSans.variable,
+        geistMono.variable,
+        "font-mono",
+        jetbrainsMono.variable
+      )}
     >
       <body className="min-h-full flex flex-col">{children}</body>
     </html>
