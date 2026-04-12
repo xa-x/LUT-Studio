@@ -1,0 +1,160 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0c0c0f;
+  --foreground: #e4e4e7;
+  --surface: #16161a;
+  --surface-hover: #1e1e24;
+  --border: #27272a;
+  --accent: #8b5cf6;
+  --accent-hover: #7c3aed;
+  --muted: #71717a;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--urface-hover);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  /* Prevent overscroll bounce on mobile */
+  overscroll-behavior: none;
+}
+
+/* Custom range slider styling */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  width: 100%;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  width: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: -6px;
+  transition: background 0.15s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  background: var(--accent-hover);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+
+input[type="range"]::-moz-range-thumb {
+  height: 16px;
+  width: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  transition: background 0.15s ease;
+}
+
+input[type="range"]::-moz-range-thumb:hover {
+  background: var(--accent-hover);
+}
+
+/* ========== MOBILE-SPECIFIC SLIDER STYLES ========== */
+@media (max-width: 767px) {
+  input[type="range"].slider-mobile {
+    height: 44px; /* Large touch target */
+  }
+
+  input[type="range"].slider-mobile::-webkit-slider-runnable-track {
+    height: 6px;
+  }
+
+  input[type="range"].slider-mobile::-webkit-slider-thumb {
+    height: 24px;
+    width: 24px;
+    margin-top: -9px;
+    border: 2px solid #0c0c0f;
+  }
+
+  input[type="range"].slider-mobile::-moz-range-track {
+    height: 6px;
+  }
+
+  input[type="range"].slider-mobile::-moz-range-thumb {
+    height: 24px;
+    width: 24px;
+    border: 2px solid #0c0c0f;
+  }
+}
+
+/* ========== MOBILE DRAWER SNAP POSITIONS ========== */
+@media (max-width: 767px) {
+  .drawer-peek {
+    height: 120px;
+  }
+
+  .drawer-half {
+    height: 55vh;
+  }
+
+  .drawer-full {
+    height: calc(100dvh - 48px);
+  }
+
+  /* Safe area padding for bottom bar */
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  /* Prevent body scroll when drawer is open */
+  body.drawer-open {
+    overflow: hidden;
+  }
+}
+
+/* ========== SCROLLBAR STYLING ========== */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* ========== VIEWPORT HEIGHT FIX ========== */
+@supports (height: 100dvh) {
+  .h-dvh-supported {
+    height: 100dvh;
+  }
+}
