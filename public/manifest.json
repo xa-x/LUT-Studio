@@ -1,0 +1,21 @@
+{
+  "name": "LUT Studio",
+  "short_name": "LUT Studio",
+  "description": "Create and export 3D LUT color filters with real-time WebGPU preview",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0c0c0f",
+  "theme_color": "#0c0c0f",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

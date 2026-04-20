@@ -12,6 +12,7 @@ import { renderCpuLutCanvas } from "@/lib/cpu-lut-canvas";
 import { fileToImageObjectUrl, isHeicLike } from "@/lib/heic";
 import { Upload } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { saveParams, loadParams } from "@/lib/storage";
 
 type Tab = "adjust" | "curves";
 
@@ -48,7 +49,13 @@ function bitmapToBlobUrl(bitmap: ImageBitmap): Promise<string | null> {
 }
 
 export default function LUTStudio() {
-  const [params, setParams] = useState<FilterParams>(freshParams());
+  const [params, setParams] = useState<FilterParams>(() => {
+    if (typeof window !== "undefined") {
+      const saved = loadParams();
+      if (saved) return saved;
+    }
+    return freshParams();
+  });
   const [activeTab, setActiveTab] = useState<Tab>("adjust");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -156,6 +163,12 @@ export default function LUTStudio() {
   useEffect(() => {
     loadImage(withBasePath("/sample.jpg"));
   }, [loadImage]);
+
+  // Persist params to localStorage (debounced)
+  useEffect(() => {
+    const timer = setTimeout(() => saveParams(params), 500);
+    return () => clearTimeout(timer);
+  }, [params]);
 
   const updatePreview = useCallback(async () => {
     if (!engineRef.current || !imageRef.current) return;
@@ -509,6 +522,15 @@ export default function LUTStudio() {
       </Button>
     </div>
   );
+
+  if (!engineReady) {
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-background">
+        <Spinner className="size-8" />
+        <p className="text-sm text-muted-foreground">Initializing color engine...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background md:h-screen">

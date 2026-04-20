@@ -87,6 +87,7 @@ export default function CurveEditor({
           size="xs"
           className="text-muted-foreground"
           onClick={() => onChange(DEFAULT_CURVE.map((p) => ({ ...p })))}
+          aria-label={`Reset ${label} curve`}
         >
           Reset
         </Button>
@@ -97,6 +98,8 @@ export default function CurveEditor({
         viewBox={`0 0 ${svgSize} ${svgSize}`}
         className="rounded border border-border bg-surface cursor-crosshair w-full max-w-[200px]"
         style={{ touchAction: "none", aspectRatio: "1" }}
+        role="img"
+        aria-label={`Color curve editor for ${label}`}
       >
         {/* Grid */}
         {[0.25, 0.5, 0.75].map((v) => (
@@ -125,6 +128,7 @@ export default function CurveEditor({
             cx={toSvgX(p.x)}
             cy={toSvgY(p.y)}
             color={color}
+            index={i}
             onDrag={(cx, cy, el) => handleDrag(i, cx, cy, el)}
           />
         ))}
@@ -137,11 +141,13 @@ function DraggablePoint({
   cx,
   cy,
   color,
+  index,
   onDrag,
 }: {
   cx: number;
   cy: number;
   color: string;
+  index: number;
   onDrag: (clientX: number, clientY: number, svg: SVGSVGElement | null) => void;
 }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -172,6 +178,7 @@ function DraggablePoint({
         r={20}
         fill="transparent"
         stroke="none"
+        aria-hidden
       />
       {/* Visible point */}
       <circle
@@ -181,6 +188,7 @@ function DraggablePoint({
         fill={color}
         stroke="#0c0c0f"
         strokeWidth={2}
+        aria-label={`Control point ${index + 1}`}
       />
     </g>
   );

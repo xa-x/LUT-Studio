@@ -17,13 +17,41 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "LUT Studio — WebGPU Color Grading",
-  description: "Create and export 3D LUT color filters with real-time WebGPU preview",
+  description:
+    "Create and export 3D LUT color filters with real-time WebGPU preview. Professional color grading in your browser with curves, presets, and .cube export.",
+  keywords: [
+    "LUT",
+    "color grading",
+    "WebGPU",
+    "3D LUT",
+    "photo editor",
+    "color correction",
+    "cube export",
+    "curves",
+    "presets",
+    "film emulation",
+  ],
+  openGraph: {
+    title: "LUT Studio — WebGPU Color Grading",
+    description:
+      "Professional color grading in your browser. Create, preview, and export 3D LUTs in real time.",
+    type: "website",
+    locale: "en_US",
+    siteName: "LUT Studio",
+  },
+  manifest: "/manifest.json",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "LUT Studio",
+  },
 };
 
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
+  themeColor: "#0c0c0f",
 };
 
 export default function RootLayout({

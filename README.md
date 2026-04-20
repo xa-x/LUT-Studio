@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# LUT Studio
+
+Professional 3D LUT color grading in your browser. Create, preview, and export `.cube` LUT files with real-time WebGPU acceleration.
+
+## Features
+
+- **Real-time preview** — GPU-accelerated color grading via WebGPU compute shaders
+- **CPU fallback** — Works on all browsers, even without WebGPU
+- **Curves editor** — Master, Red, Green, Blue channel curves with drag-to-edit control points
+- **30+ presets** — Cinematic looks, Fuji film simulations, Kodak film stocks
+- **Full filter controls** — Exposure, contrast, saturation, temperature, tint, vibrance, highlights, shadows, per-channel lift/gamma/gain
+- **`.cube` export** — Export standard 3D LUT files compatible with DaVinci Resolve, Premiere Pro, Final Cut Pro, and more
+- **Image export** — Save graded images directly
+- **HEIC support** — Import iPhone HEIC/HEIF photos
+- **State persistence** — Your adjustments are saved automatically
+- **Responsive** — Works on desktop and mobile with touch-optimized controls
+- **Dark theme** — Easy on the eyes during long grading sessions
+
+## Tech Stack
+
+- **Next.js 16** — App Router, React 19, Server Components
+- **WebGPU** — Compute shaders for LUT generation and image processing
+- **Tailwind CSS 4** + **shadcn/ui** — Styling and UI components
+- **WGSL shaders** — Custom compute shaders for LUT generation and application
+- **TypeScript** — Full type safety
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
+bun install
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## How It Works
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. **Upload** — Drop or select any image (including HEIC)
+2. **Adjust** — Use sliders and presets for color grading, or drag curve control points
+3. **Export** — Download a `.cube` LUT file to use in your NLE, or save the graded image
 
-## Learn More
+The 3D LUT is generated as a 32×32×32 color mapping table using WebGPU compute shaders for real-time performance. The CPU fallback generates the same LUT on the main thread.
 
-To learn more about Next.js, take a look at the following resources:
+## Privacy
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+All processing happens locally in your browser. No images or data are ever uploaded to any server. See [/privacy](/privacy) for details.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## License
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+MIT
