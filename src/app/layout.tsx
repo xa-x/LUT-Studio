@@ -71,7 +71,7 @@ export default function RootLayout({
         jetbrainsMono.variable
       )}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col bg-[#0c0c0f]">{children}</body>
     </html>
   );
 }

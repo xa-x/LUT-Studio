@@ -3,6 +3,7 @@
 import { FilterParams, LUTEngine, freshParams } from "@/lib/lut-engine";
 import FilterPanel from "@/components/FilterPanel";
 import CurvesPanel from "@/components/CurvesPanel";
+import AIFilmMimic from "@/components/AIFilmMimic";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -10,11 +11,13 @@ import { withBasePath } from "@/lib/base-path";
 import { cn } from "@/lib/utils";
 import { renderCpuLutCanvas } from "@/lib/cpu-lut-canvas";
 import { fileToImageObjectUrl, isHeicLike } from "@/lib/heic";
-import { Upload } from "lucide-react";
+import { Sparkles, Upload, Save, GalleryHorizontal } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { saveParams, loadParams } from "@/lib/storage";
+import SaveLutDialog from "@/components/SaveLutDialog";
+import Link from "next/link";
 
-type Tab = "adjust" | "curves";
+type Tab = "adjust" | "curves" | "ai";
 
 const EXPORT_MAX_DIM = 8192;
 
@@ -71,6 +74,7 @@ export default function LUTStudio() {
   const [isDragging, setIsDragging] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerSnap, setDrawerSnap] = useState<"peek" | "half" | "full">("half");
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
 
   const engineRef = useRef<LUTEngine | null>(null);
   const gpuPreviewCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -163,6 +167,27 @@ export default function LUTStudio() {
   useEffect(() => {
     loadImage(withBasePath("/sample.jpg"));
   }, [loadImage]);
+
+  // Load params from URL search params (e.g. from Gallery "Apply in Studio")
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    const lutParam = sp.get("lut");
+    if (lutParam) {
+      try {
+        const parsed = JSON.parse(decodeURIComponent(lutParam));
+        if (parsed && typeof parsed === "object") {
+          setParams(parsed as FilterParams);
+          // Clean the URL without reload
+          const url = new URL(window.location.href);
+          url.searchParams.delete("lut");
+          window.history.replaceState({}, "", url.pathname);
+        }
+      } catch {
+        // Invalid params — ignore
+      }
+    }
+  }, []);
 
   // Persist params to localStorage (debounced)
   useEffect(() => {
@@ -476,6 +501,14 @@ export default function LUTStudio() {
     setDrawerSnap("half");
   };
 
+  const handleApplyAIParams = useCallback(
+    (aiParams: FilterParams) => {
+      setParams(aiParams);
+      setActiveTab("adjust");
+    },
+    [],
+  );
+
   const tabBar = (
     <Tabs
       value={activeTab}
@@ -489,12 +522,19 @@ export default function LUTStudio() {
         <TabsTrigger value="curves" className="flex-1 rounded-none">
           Curves
         </TabsTrigger>
+        <TabsTrigger value="ai" className="flex-1 gap-1 rounded-none">
+          <Sparkles className="size-3.5" />
+          AI
+        </TabsTrigger>
       </TabsList>
       <TabsContent value="adjust" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
         <FilterPanel params={params} onChange={setParams} />
       </TabsContent>
       <TabsContent value="curves" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
         <CurvesPanel params={params} onChange={setParams} />
+      </TabsContent>
+      <TabsContent value="ai" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
+        <AIFilmMimic onApplyParams={handleApplyAIParams} />
       </TabsContent>
     </Tabs>
   );
@@ -560,11 +600,23 @@ export default function LUTStudio() {
       >
         <div className="hidden items-center justify-between border-b border-border px-6 py-3 md:flex">
           <div className="flex items-center gap-3">
-            <div className="bg-primary size-2 animate-pulse rounded-full" />
-            <h1 className="text-sm font-semibold tracking-tight">LUT Studio</h1>
+            <Link href={withBasePath("/")} className="flex items-center gap-2">
+              <div className="bg-primary size-2 animate-pulse rounded-full" />
+              <h1 className="text-sm font-semibold tracking-tight">LUT Studio</h1>
+            </Link>
             <span className="font-mono text-[10px] text-muted-foreground">{useCPU ? "CPU" : "WebGPU"}</span>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <Link href={withBasePath("/gallery")}>
+              <Button type="button" variant="ghost" size="sm" aria-label="Open Gallery">
+                <GalleryHorizontal className="size-3.5" />
+                Gallery
+              </Button>
+            </Link>
+            <Button type="button" variant="outline" size="sm" onClick={() => setSaveDialogOpen(true)} aria-label="Save LUT">
+              <Save className="size-3.5" />
+              Save
+            </Button>
             <Button type="button" variant="outline" size="sm" onClick={triggerFileInput} aria-label="Upload image">
               Upload image
             </Button>
@@ -583,7 +635,26 @@ export default function LUTStudio() {
             <h1 className="text-xs font-semibold tracking-tight">LUT Studio</h1>
             <span className="font-mono text-[9px] text-muted-foreground">{useCPU ? "CPU" : "GPU"}</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <Link href={withBasePath("/gallery")}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Open Gallery"
+              >
+                <GalleryHorizontal className="size-3.5" />
+              </Button>
+            </Link>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setSaveDialogOpen(true)}
+              aria-label="Save LUT"
+            >
+              <Save className="size-3.5" />
+            </Button>
             <Button
               type="button"
               variant="outline"
@@ -708,6 +779,18 @@ export default function LUTStudio() {
           >
             <span className="text-[10px] font-medium">Curves</span>
           </button>
+
+          <button
+            type="button"
+            onClick={() => openDrawerWithTab("ai")}
+            className={`flex flex-col items-center justify-center gap-0.5 px-3 py-2.5 transition-colors ${
+              drawerOpen && activeTab === "ai" ? "text-violet-400" : "text-muted-foreground"
+            }`}
+            aria-label="Open AI film mimic"
+          >
+            <Sparkles className="size-3.5" />
+            <span className="text-[10px] font-medium">AI</span>
+          </button>
         </div>
 
         {drawerOpen ? (
@@ -741,6 +824,12 @@ export default function LUTStudio() {
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{tabBar}</div>
         </div>
       </div>
+
+      <SaveLutDialog
+        open={saveDialogOpen}
+        onOpenChange={setSaveDialogOpen}
+        params={params}
+      />
     </div>
   );
 }

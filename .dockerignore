@@ -1,0 +1,40 @@
+# Dependencies
+node_modules
+bun.lock
+
+# Build output
+.next
+out
+
+# Database & data
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Misc
+*.log
+npm-debug.log*
