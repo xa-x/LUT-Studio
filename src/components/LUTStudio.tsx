@@ -135,31 +135,51 @@ export default function LUTStudio() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    const initCPU = () => {
+      if (cancelled) return;
+      setUseCPU(true);
+      setGpuPreviewReady(false);
+      const engine = new LUTEngine();
+      engineRef.current = engine;
+      setEngineReady(true);
+    };
+
     const init = async () => {
       if (!navigator.gpu) {
-        setUseCPU(true);
-        setGpuPreviewReady(false);
-        const engine = new LUTEngine();
-        engineRef.current = engine;
-        setEngineReady(true);
+        initCPU();
         return;
       }
+
       const engine = new LUTEngine();
-      const ok = await engine.init();
-      if (ok) {
-        engineRef.current = engine;
-        setEngineReady(true);
-      } else {
-        console.warn("WebGPU init failed, falling back to CPU processing");
-        setUseCPU(true);
-        setGpuPreviewReady(false);
-        const cpuEngine = new LUTEngine();
-        engineRef.current = cpuEngine;
-        setEngineReady(true);
+
+      // WebGPU init can hang on unsupported browsers (mobile Safari, etc.)
+      // Race with a 5-second timeout
+      const timeout = new Promise<false>((resolve) =>
+        setTimeout(() => resolve(false), 5000),
+      );
+
+      try {
+        const ok = await Promise.race([engine.init(), timeout]);
+        if (cancelled) return;
+
+        if (ok) {
+          engineRef.current = engine;
+          setEngineReady(true);
+        } else {
+          console.warn("WebGPU init failed or timed out, falling back to CPU");
+          initCPU();
+        }
+      } catch (err) {
+        if (cancelled) return;
+        console.warn("WebGPU init error, falling back to CPU:", err);
+        initCPU();
       }
     };
     void init();
     return () => {
+      cancelled = true;
       engineRef.current?.destroy();
     };
   }, []);
