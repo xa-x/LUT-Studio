@@ -43,13 +43,15 @@ interface VisionResponse {
 
 const SYSTEM_PROMPT = `You are an expert colorist and film analyst. You analyze photographs to determine what film stock, color grading, or cinematic look was applied. You must respond with ONLY a JSON object — no markdown, no explanation outside the JSON.
 
-Analyze the provided photo's color grading characteristics:
+Analyze the provided reference photo's color grading characteristics:
 - Color temperature (warm vs cool)
 - Contrast and tonality
 - Saturation and vibrance
 - Color shifts (lift/gamma/gain per channel)
 - Highlight and shadow behavior
 - Overall mood and aesthetic
+
+If a "current image" is also provided, analyze how the reference look should be applied to transform the current image into the reference style. Focus on the difference between them.
 
 Return a JSON object with exactly these fields and value ranges:
 {
@@ -88,11 +90,11 @@ Important:
 // ---------------------------------------------------------------------------
 
 function getBaseUrl(): string {
-  return process.env.OPENAI_BASE_URL?.replace(/\/$/, "") ?? "https://api.openai.com/v1";
+  return process.env.AI_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:11434/v1";
 }
 
 function getModel(): string {
-  return process.env.AI_MODEL ?? "gpt-4o";
+  return process.env.AI_MODEL ?? "gemma4:latest";
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -133,53 +135,76 @@ function clampResponse(raw: VisionResponse): VisionResponse {
  * Analyze a reference photo's color grading via a vision model and return
  * matching FilterParams that can be applied to reproduce the look.
  *
- * @param base64Image — base64-encoded image data (with or without data URI prefix)
+ * @param base64Image — base64-encoded reference image (with or without data URI prefix)
+ * @param currentImageBase64 — optional base64-encoded current image for comparison
  */
 export async function analyzeFilmLook(
   base64Image: string,
+  currentImageBase64?: string,
 ): Promise<AIFilmAnalysisResult> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "OPENAI_API_KEY is not configured. Set it in your environment to use AI film analysis.",
-    );
-  }
-
-  // Strip data URI prefix if present
-  const base64Data = base64Image.replace(/^data:[^;]+;base64,/, "");
-
   const baseUrl = getBaseUrl();
   const model = getModel();
 
+  // Strip data URI prefix if present
+  const stripPrefix = (s: string) => s.replace(/^data:[^;]+;base64,/, "");
+  const refData = stripPrefix(base64Image);
+
+  // Build the user message content with reference photo (+ optional current image)
+  const userContent: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> = [];
+
+  // If we have a current image, show both for comparison
+  if (currentImageBase64) {
+    const curData = stripPrefix(currentImageBase64);
+    userContent.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${curData}`, detail: "low" },
+    });
+    userContent.push({
+      type: "text",
+      text: "The FIRST image is the current photo being edited. The SECOND image is the reference with the desired film look.",
+    });
+    userContent.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${refData}`, detail: "high" },
+    });
+    userContent.push({
+      type: "text",
+      text: "Analyze the reference (second) photo's color grading. Determine what filter adjustments are needed to transform the current (first) photo to match the reference look. Return the JSON matching the specified schema.",
+    });
+  } else {
+    // Reference only
+    userContent.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${refData}`, detail: "high" },
+    });
+    userContent.push({
+      type: "text",
+      text: "Analyze the color grading and film look of this photo. Return the JSON matching the specified schema.",
+    });
+  }
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  // Ollama doesn't require an API key; OpenAI-compatible services do
+  const apiKey = process.env.AI_API_KEY || process.env.OPENAI_API_KEY;
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+    headers,
     body: JSON.stringify({
       model,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Data}`,
-                detail: "high",
-              },
-            },
-            {
-              type: "text",
-              text: "Analyze the color grading and film look of this photo. Return the JSON matching the specified schema.",
-            },
-          ],
-        },
+        { role: "user", content: userContent },
       ],
       max_tokens: 1024,
       temperature: 0.3,
+      stream: false,
     }),
   });
 
@@ -191,7 +216,8 @@ export async function analyzeFilmLook(
   }
 
   const json = await response.json();
-  const content: string | undefined = json.choices?.[0]?.message?.content;
+  const content: string | undefined = json.choices?.[0]?.message?.content
+    || json.message?.content;  // Ollama can return either format
 
   if (!content) {
     throw new Error("No content returned from vision model");

@@ -5,14 +5,52 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { analyzeFilmLook, type AIFilmAnalysisResult } from "@/app/actions/ai-actions";
 import { freshParams, type FilterParams } from "@/lib/lut-engine";
-import { Sparkles, Upload, X, ImageIcon } from "lucide-react";
+import { Sparkles, Upload, X, ImageIcon, Camera } from "lucide-react";
 
 interface AIFilmMimicProps {
   onApplyParams: (params: FilterParams) => void;
+  /** Ref to the preview canvas (WebGPU) so we can grab the current graded image */
+  gpuCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
+  /** Ref to the original image element */
+  imageRef?: React.RefObject<HTMLImageElement | null>;
+  /** Whether we're in CPU mode (use previewUrl img instead of canvas) */
+  useCPU?: boolean;
+  /** Current preview URL blob (for CPU mode capture) */
+  previewUrl?: string | null;
 }
 
-export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+/** Downscale and convert canvas/image to JPEG base64 for API upload. */
+function canvasToBase64(
+  source: HTMLCanvasElement | HTMLImageElement,
+  maxDim: number = 1024,
+): string {
+  const canvas = document.createElement("canvas");
+  let w = "naturalWidth" in source ? source.naturalWidth : source.width;
+  let h = "naturalHeight" in source ? source.naturalHeight : source.height;
+
+  if (Math.max(w, h) > maxDim) {
+    const scale = maxDim / Math.max(w, h);
+    w = Math.round(w * scale);
+    h = Math.round(h * scale);
+  }
+
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(source, 0, 0, w, h);
+
+  // toDataURL returns data:image/jpeg;base64,...
+  return canvas.toDataURL("image/jpeg", 0.85);
+}
+
+export default function AIFilmMimic({
+  onApplyParams,
+  gpuCanvasRef,
+  imageRef,
+  useCPU = false,
+  previewUrl,
+}: AIFilmMimicProps) {
+  const [refPreviewUrl, setRefPreviewUrl] = useState<string | null>(null);
   const [base64Data, setBase64Data] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<AIFilmAnalysisResult | null>(null);
@@ -32,7 +70,7 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = reader.result as string;
-        setPreviewUrl(dataUrl);
+        setRefPreviewUrl(dataUrl);
         setBase64Data(dataUrl);
       };
       reader.onerror = () => {
@@ -43,6 +81,27 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
     [],
   );
 
+  /** Capture the current graded image as base64. */
+  const captureCurrentImage = useCallback((): string | null => {
+    try {
+      // If we have a GPU canvas with content, capture from there
+      if (!useCPU && gpuCanvasRef?.current) {
+        const canvas = gpuCanvasRef.current;
+        if (canvas.width > 0 && canvas.height > 0) {
+          return canvasToBase64(canvas, 1024);
+        }
+      }
+
+      // CPU mode: capture from the preview img or the original image
+      if (imageRef?.current) {
+        return canvasToBase64(imageRef.current, 1024);
+      }
+    } catch (err) {
+      console.warn("Failed to capture current image:", err);
+    }
+    return null;
+  }, [gpuCanvasRef, imageRef, useCPU]);
+
   const handleAnalyze = useCallback(async () => {
     if (!base64Data) return;
 
@@ -51,7 +110,9 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
     setResult(null);
 
     try {
-      const analysisResult = await analyzeFilmLook(base64Data);
+      // Capture current image to send alongside reference for comparison
+      const currentImage = captureCurrentImage();
+      const analysisResult = await analyzeFilmLook(base64Data, currentImage ?? undefined);
       setResult(analysisResult);
     } catch (err) {
       const message =
@@ -60,7 +121,7 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
     } finally {
       setIsAnalyzing(false);
     }
-  }, [base64Data]);
+  }, [base64Data, captureCurrentImage]);
 
   const handleApply = useCallback(() => {
     if (!result) return;
@@ -76,7 +137,7 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
   }, [result, onApplyParams]);
 
   const handleClear = useCallback(() => {
-    setPreviewUrl(null);
+    setRefPreviewUrl(null);
     setBase64Data(null);
     setResult(null);
     setError(null);
@@ -91,7 +152,7 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
             <Sparkles className="mr-1.5 inline size-3.5" />
             AI Film Mimic
           </h3>
-          {previewUrl ? (
+          {refPreviewUrl ? (
             <Button
               type="button"
               variant="ghost"
@@ -106,8 +167,8 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
         </div>
 
         <p className="mb-3 text-[10px] text-muted-foreground md:text-[11px]">
-          Upload a reference photo and AI will detect the film stock or color
-          grading, then generate matching filter settings.
+          Upload a reference photo. AI will analyze its film look and apply matching
+          color grading to your current image.
         </p>
 
         <input
@@ -120,11 +181,11 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
           tabIndex={-1}
         />
 
-        {previewUrl ? (
+        {refPreviewUrl ? (
           <div className="relative overflow-hidden rounded-lg border border-border">
             {/* eslint-disable-next-line @next/next/no-img-element -- data URL preview */}
             <img
-              src={previewUrl}
+              src={refPreviewUrl}
               alt="Reference photo"
               className="max-h-40 w-full object-contain"
             />
@@ -136,6 +197,9 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
             >
               <X className="size-3.5" />
             </button>
+            <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent px-2 py-1.5">
+              <span className="text-[9px] font-medium text-white/80">Reference</span>
+            </div>
           </div>
         ) : (
           <button
@@ -166,15 +230,18 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
           {isAnalyzing ? (
             <>
               <Spinner className="size-4" />
-              Analyzing...
+              Analyzing with {typeof window !== "undefined" && window.location.hostname === "localhost" ? "Gemma 4" : "AI"}...
             </>
           ) : (
             <>
-              <Sparkles className="size-4" />
+              <Camera className="size-4" />
               Analyze Film Look
             </>
           )}
         </Button>
+        <p className="mt-2 text-center text-[9px] text-muted-foreground">
+          Your current image will be captured and compared with the reference
+        </p>
       </div>
 
       {/* Error */}
@@ -207,14 +274,18 @@ export default function AIFilmMimic({ onApplyParams }: AIFilmMimicProps) {
               Detected Parameters
             </h4>
             <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-              {Object.entries(result.params).map(([key, value]) => (
-                <div key={key} className="flex items-center justify-between text-[10px]">
-                  <span className="text-muted-foreground">{key}</span>
-                  <span className="font-mono text-muted-foreground">
-                    {typeof value === "number" ? value.toFixed(3) : String(value)}
-                  </span>
-                </div>
-              ))}
+              {Object.entries(result.params).map(([key, value]) => {
+                // Skip curves in the preview (too complex for grid)
+                if (key.endsWith("Curve")) return null;
+                return (
+                  <div key={key} className="flex items-center justify-between text-[10px]">
+                    <span className="text-muted-foreground">{key}</span>
+                    <span className="font-mono text-muted-foreground">
+                      {typeof value === "number" ? value.toFixed(3) : String(value)}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           </div>
 

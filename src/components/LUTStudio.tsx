@@ -534,7 +534,13 @@ export default function LUTStudio() {
         <CurvesPanel params={params} onChange={setParams} />
       </TabsContent>
       <TabsContent value="ai" className="mt-0 min-h-0 flex-1 overflow-hidden data-[state=inactive]:hidden">
-        <AIFilmMimic onApplyParams={handleApplyAIParams} />
+        <AIFilmMimic
+          onApplyParams={handleApplyAIParams}
+          gpuCanvasRef={gpuPreviewCanvasRef}
+          imageRef={imageRef}
+          useCPU={useCPU}
+          previewUrl={previewUrl}
+        />
       </TabsContent>
     </Tabs>
   );
