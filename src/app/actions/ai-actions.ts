@@ -1,13 +1,11 @@
 "use server";
 
-import type { FilterParams } from "@/lib/lut-engine";
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface AIFilmAnalysisResult {
-  params: Partial<FilterParams>;
+  params: Record<string, number>;
   filmName: string;
   description: string;
 }
@@ -55,7 +53,7 @@ If a "current image" is also provided, analyze how the reference look should be 
 
 Return a JSON object with exactly these fields and value ranges:
 {
-  "filmName": "string — the closest matching film stock or look name (e.g. 'Kodak Portra 400', 'Fuji Pro 400H', 'Kodachrome 64', 'Cinematic Teal & Orange')",
+  "filmName": "string — the closest matching film stock or look name",
   "description": "string — brief description of the detected look (1-2 sentences)",
   "brightness": number,      // -0.5 to 0.5 (default 0)
   "contrast": number,        // 0.2 to 2 (default 1)
@@ -128,12 +126,61 @@ function clampResponse(raw: VisionResponse): VisionResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Truncated JSON Repair
+// ---------------------------------------------------------------------------
+
+const DEFAULT_VALUES: Record<string, number> = {
+  brightness: 0, contrast: 1, saturation: 1, hue: 0, temperature: 0,
+  tint: 0, exposure: 0, gamma: 1, highlights: 0, shadows: 0, vibrance: 0,
+  redLift: 0, redGamma: 1, redGain: 1, greenLift: 0, greenGamma: 1,
+  greenGain: 1, blueLift: 0, blueGamma: 1, blueGain: 1,
+};
+
+const NUMERIC_FIELDS = Object.keys(DEFAULT_VALUES);
+
+function repairTruncatedJson(raw: string): VisionResponse | null {
+  // Try to close the JSON and fill missing fields with defaults
+  let s = raw.trim();
+
+  // Remove trailing incomplete key-value pair (partial string/number)
+  s = s.replace(/,?\s*"[^"]*"?\s*:?\s*$/, "");
+
+  // Count brackets
+  const openBraces = (s.match(/{/g) || []).length;
+  const closeBraces = (s.match(/}/g) || []).length;
+  const missing = openBraces - closeBraces;
+
+  // Close the object
+  for (let i = 0; i < missing; i++) s += "}";
+
+  let partial: Record<string, unknown>;
+  try {
+    partial = JSON.parse(s);
+  } catch {
+    return null;
+  }
+
+  // Ensure required string fields
+  if (!partial.filmName) partial.filmName = "Unknown Film Look";
+  if (!partial.description) partial.description = "AI-detected color grading";
+
+  // Fill missing numeric fields with defaults
+  for (const field of NUMERIC_FIELDS) {
+    if (typeof partial[field] !== "number") {
+      (partial as Record<string, unknown>)[field] = DEFAULT_VALUES[field];
+    }
+  }
+
+  return partial as unknown as VisionResponse;
+}
+
+// ---------------------------------------------------------------------------
 // Server Action
 // ---------------------------------------------------------------------------
 
 /**
  * Analyze a reference photo's color grading via a vision model and return
- * matching FilterParams that can be applied to reproduce the look.
+ * matching filter params that can be applied to reproduce the look.
  *
  * @param base64Image — base64-encoded reference image (with or without data URI prefix)
  * @param currentImageBase64 — optional base64-encoded current image for comparison
@@ -161,7 +208,7 @@ export async function analyzeFilmLook(
     });
     userContent.push({
       type: "text",
-      text: "The FIRST image is the current photo being edited. The SECOND image is the reference with the desired film look.",
+      text: "FIRST image = current photo being edited. SECOND image = reference with the desired film look.",
     });
     userContent.push({
       type: "image_url",
@@ -169,7 +216,7 @@ export async function analyzeFilmLook(
     });
     userContent.push({
       type: "text",
-      text: "Analyze the reference (second) photo's color grading. Determine what filter adjustments are needed to transform the current (first) photo to match the reference look. Return the JSON matching the specified schema.",
+      text: "Analyze the reference (second) photo's color grading. Return JSON adjustments to transform the current (first) photo to match.",
     });
   } else {
     // Reference only
@@ -202,9 +249,12 @@ export async function analyzeFilmLook(
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userContent },
       ],
-      max_tokens: 1024,
+      max_tokens: 4096,
       temperature: 0.3,
       stream: false,
+      options: {
+        num_ctx: 8192,
+      },
     }),
   });
 
@@ -217,7 +267,7 @@ export async function analyzeFilmLook(
 
   const json = await response.json();
   const content: string | undefined = json.choices?.[0]?.message?.content
-    || json.message?.content;  // Ollama can return either format
+    || json.message?.content; // Ollama can return either format
 
   if (!content) {
     throw new Error("No content returned from vision model");
@@ -230,11 +280,17 @@ export async function analyzeFilmLook(
     jsonStr = fenceMatch[1]!.trim();
   }
 
+  // Attempt to parse; if truncated, try to repair
   let parsed: VisionResponse;
   try {
     parsed = JSON.parse(jsonStr);
   } catch {
-    throw new Error(`Failed to parse vision model response as JSON: ${jsonStr.slice(0, 200)}`);
+    // Model may have truncated at max_tokens — try to repair
+    const repaired = repairTruncatedJson(jsonStr);
+    if (!repaired) {
+      throw new Error(`Failed to parse vision model response as JSON: ${jsonStr.slice(0, 200)}`);
+    }
+    parsed = repaired;
   }
 
   // Validate required fields exist
