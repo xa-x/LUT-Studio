@@ -56,25 +56,32 @@ export function renderCpuLutCanvas(
       return [lutData[j], lutData[j + 1], lutData[j + 2]];
     };
 
+    // Sample 8 corners of the LUT cell
+    // idx(b, g, r) → B slowest, G middle, R fastest (standard .cube axis order)
+    // Naming convention: cBGR where 0=low, 1=high for each axis
     const c000 = sample(b0, g0, r0);
-    const c100 = sample(b1, g0, r0);
-    const c010 = sample(b0, g1, r0);
-    const c110 = sample(b1, g1, r0);
-    const c001 = sample(b0, g0, r1);
-    const c101 = sample(b1, g0, r1);
-    const c011 = sample(b0, g1, r1);
-    const c111 = sample(b1, g1, r1);
+    const c001 = sample(b0, g0, r1); // r+1
+    const c010 = sample(b0, g1, r0); // g+1
+    const c011 = sample(b0, g1, r1); // g+1, r+1
+    const c100 = sample(b1, g0, r0); // b+1
+    const c101 = sample(b1, g0, r1); // b+1, r+1
+    const c110 = sample(b1, g1, r0); // b+1, g+1
+    const c111 = sample(b1, g1, r1); // b+1, g+1, r+1
 
     const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
+    // Trilinear interpolation: R fastest → G middle → B slowest
     for (let c = 0; c < 3; c++) {
+      // Step 1: interpolate along R (fastest axis)
       const c00 = lerp(c000[c], c001[c], rD);
       const c01 = lerp(c010[c], c011[c], rD);
       const c10 = lerp(c100[c], c101[c], rD);
       const c11 = lerp(c110[c], c111[c], rD);
-      const c0f = lerp(c00, c10, bD);
-      const c1f = lerp(c01, c11, bD);
-      const val = lerp(c0f, c1f, gD);
+      // Step 2: interpolate along G (middle axis)
+      const c0f = lerp(c00, c01, gD);
+      const c1f = lerp(c10, c11, gD);
+      // Step 3: interpolate along B (slowest axis)
+      const val = lerp(c0f, c1f, bD);
       data[i + c] = Math.round(Math.max(0, Math.min(1, val)) * 255);
     }
   }
